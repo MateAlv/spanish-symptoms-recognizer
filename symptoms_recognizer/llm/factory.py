@@ -20,11 +20,24 @@ KNOWN_PROVIDERS = (
 
 DEFAULT_TIMEOUT_SECONDS = 180
 
+# Both CLI providers are subscription-throttled rather than billed per token,
+# so a default ceiling is safer than none. Overridden by LLM_REQUESTS_PER_MINUTE.
+DEFAULT_REQUESTS_PER_MINUTE = 60.0
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 
 def build_provider(
     provider: str | None = None,
     model: str | None = None,
     timeout: int | None = None,
+    cache: bool | None = None,
+    requests_per_minute: float | None = None,
 ) -> LLMProvider:
     """Build the configured LLM provider.
 
@@ -32,6 +45,31 @@ def build_provider(
     benchmark can be pointed at codex locally and at a hosted API in
     production without touching the pipeline code.
     """
+    base = _build_base_provider(provider, model, timeout)
+
+    # Rate limiting goes on first, so the cache can answer without spending a
+    # token from the bucket.
+    rpm = (
+        requests_per_minute
+        if requests_per_minute is not None
+        else float(os.environ.get("LLM_REQUESTS_PER_MINUTE", DEFAULT_REQUESTS_PER_MINUTE))
+    )
+    if rpm > 0:
+        from symptoms_recognizer.llm.caching import RateLimitedProvider
+
+        base = RateLimitedProvider(base, requests_per_minute=rpm)
+
+    if cache if cache is not None else _env_flag("LLM_CACHE_ENABLED", True):
+        from symptoms_recognizer.llm.caching import CachingProvider
+
+        base = CachingProvider(base)
+
+    return base
+
+
+def _build_base_provider(
+    provider: str | None, model: str | None, timeout: int | None
+) -> LLMProvider:
     provider = (
         provider or os.environ.get("LLM_PROVIDER") or CLAUDE_CLI_PROVIDER
     ).lower()
