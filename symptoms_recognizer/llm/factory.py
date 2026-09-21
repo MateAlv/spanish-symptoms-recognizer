@@ -5,12 +5,14 @@ import os
 from symptoms_recognizer.llm.base import LLMError, LLMProvider
 
 CODEX_PROVIDER = "codex"
+CLAUDE_CLI_PROVIDER = "claude-cli"
 OPENAI_PROVIDER = "openai"
 ANTHROPIC_PROVIDER = "anthropic"
 GEMINI_PROVIDER = "gemini"
 
 KNOWN_PROVIDERS = (
     CODEX_PROVIDER,
+    CLAUDE_CLI_PROVIDER,
     OPENAI_PROVIDER,
     ANTHROPIC_PROVIDER,
     GEMINI_PROVIDER,
@@ -30,11 +32,21 @@ def build_provider(
     benchmark can be pointed at codex locally and at a hosted API in
     production without touching the pipeline code.
     """
-    provider = (provider or os.environ.get("LLM_PROVIDER") or CODEX_PROVIDER).lower()
+    provider = (
+        provider or os.environ.get("LLM_PROVIDER") or CLAUDE_CLI_PROVIDER
+    ).lower()
     model = model or os.environ.get("LLM_MODEL")
     timeout = timeout or int(
         os.environ.get("LLM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     )
+
+    if provider == CLAUDE_CLI_PROVIDER:
+        from symptoms_recognizer.llm.claude_cli_provider import (
+            DEFAULT_MODEL,
+            ClaudeCLIProvider,
+        )
+
+        return ClaudeCLIProvider(model=model or DEFAULT_MODEL, timeout=timeout)
 
     if provider == CODEX_PROVIDER:
         from symptoms_recognizer.llm.codex_provider import (
