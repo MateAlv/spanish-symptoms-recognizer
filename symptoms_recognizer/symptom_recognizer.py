@@ -2,13 +2,21 @@ from symptoms_recognizer.mapper.mapper import PhenotypeOntologyMapper
 from symptoms_recognizer.ner_model.model import PhenotypesDetector
 from symptoms_recognizer.text_parser.chunks_sentences_parser import ChunkSentencesParser
 from symptoms_recognizer.text_parser.full_text_parser import FullTextParser
-from symptoms_recognizer.text_parser.sections_parser import SectionsSentencesParser
 from symptoms_recognizer.text_parser.sentences_parser import SentencesParser
+
+
+def _build_sections_parser():
+    # Imported on use: this is the only parser that needs medspacy, and
+    # importing it eagerly made every other configuration require it too.
+    from symptoms_recognizer.text_parser.sections_parser import SectionsSentencesParser
+
+    return SectionsSentencesParser()
+
 
 TEXT_PARSER_BUILDERS = {
     "chunks-sentences": lambda: ChunkSentencesParser(max_chunk_tokens=384, overlap_sentences=1),
     "sentences": SentencesParser,
-    "sections-sentences": SectionsSentencesParser,
+    "sections-sentences": _build_sections_parser,
     "full-text": FullTextParser,
 }
 
@@ -38,9 +46,12 @@ class PhenotypesRecognizer:
         )
 
         try:
-            self.text_parser = TEXT_PARSER_BUILDERS[text_parser]()
+            build_parser = TEXT_PARSER_BUILDERS[text_parser]
         except KeyError:
-            raise Exception("No known parser")
+            known = ", ".join(sorted(TEXT_PARSER_BUILDERS))
+            raise ValueError(f"Unknown text parser {text_parser!r}. Known: {known}")
+
+        self.text_parser = build_parser()
 
     def recognize(self, text: str) -> list[tuple[str, str]]:
         return self.text_parser.apply(text, self.ner_model)
