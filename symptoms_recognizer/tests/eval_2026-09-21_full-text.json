@@ -1,0 +1,1 @@
+{"parser": "full-text", "elapsed_s": 331.1, "tp": 49, "fp": 37, "fn": 10, "precision": 0.5698, "recall": 0.8305, "micro_f1": 0.6759}
