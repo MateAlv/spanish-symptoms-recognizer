@@ -87,6 +87,26 @@ class TestResponseShape:
         assert response["phenotypes"] == []
         assert recognizer.seen == []
 
+    def test_offsets_resolve_against_offset_text_when_given(self, labels):
+        # The gateway extracts from a normalised copy, which regex rewriting
+        # can lengthen or shorten, and needs offsets into the user's own text.
+        extractor = RecognizerExtractor(
+            recognizer=StubRecognizer([("fiebre", "HP:0001945")]), label_index=labels
+        )
+        original = "Paciente  con  fiebre"
+        response = extractor.extract("Paciente con fiebre", offset_text=original)
+
+        item = response["phenotypes"][0]
+        assert original[item["start_es"]:item["end_es"]] == "fiebre"
+
+    def test_offsets_fall_back_to_the_extracted_text(self, labels):
+        extractor = RecognizerExtractor(
+            recognizer=StubRecognizer([("fiebre", "HP:0001945")]), label_index=labels
+        )
+        text = "Presenta fiebre"
+        item = extractor.extract(text)["phenotypes"][0]
+        assert text[item["start_es"]:item["end_es"]] == "fiebre"
+
     def test_provider_failure_propagates(self, labels):
         class Failing:
             def scan(self, text):

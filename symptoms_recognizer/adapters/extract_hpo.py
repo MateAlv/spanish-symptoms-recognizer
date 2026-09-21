@@ -49,8 +49,13 @@ class RecognizerExtractor:
         self.label_index = label_index
         self.model_name = model or "default"
 
-    def extract(self, text: str) -> dict:
+    def extract(self, text: str, offset_text: str | None = None) -> dict:
         """Extract phenotypes from Spanish clinical text.
+
+        `offset_text` is what character offsets are resolved against, for a
+        caller that extracts from a normalised copy: normalisation rewrites
+        the text by regex and can change its length, so an offset taken from
+        the copy would not line up with what the user actually sent.
 
         Raises `LLMError` when the model cannot be reached. The caller decides
         what to do about that -- returning an empty phenotype list would read
@@ -63,7 +68,9 @@ class RecognizerExtractor:
         started = time.monotonic()
         scan_results = self.recognizer.scan(text)
         items = build_phenotype_items(
-            scan_results, source_text=text, label_index=self.label_index
+            scan_results,
+            source_text=offset_text if offset_text is not None else text,
+            label_index=self.label_index,
         )
 
         logger.info(
