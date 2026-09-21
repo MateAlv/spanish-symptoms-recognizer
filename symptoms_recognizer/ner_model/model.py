@@ -2,10 +2,9 @@ from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from transformers import pipeline
 
-from symptoms_recognizer.api_clients import build_api_client
-import json
+from symptoms_recognizer.llm import build_provider
+from symptoms_recognizer.llm.json_parsing import parse_json_object
 import os
-import re
 import torch
 
 # Local model path
@@ -90,17 +89,9 @@ EJEMPLO DE SALIDA:
             self._detect_fn = self._detect_local_llm
 
         elif phenotypes_model_type == "api":
-            if not api_model_name:
-                raise ValueError("api_model_name es obligatorio cuando phenotypes_model_type='api'")
-
-            self.client = build_api_client(self.api_provider)
-
-            api_call_fns = {
-                "gemini": self._call_gemini_ner,
-                "openai": self._call_openai_ner,
-                "anthropic": self._call_anthropic_ner,
-            }
-            self._api_call_fn = api_call_fns[self.api_provider]
+            self.provider = build_provider(
+                provider=self.api_provider, model=self.api_model_name
+            )
             self._detect_fn = self._detect_api
 
         else:
@@ -160,75 +151,28 @@ EJEMPLO DE SALIDA:
         if not text_chunk or not text_chunk.strip():
             return []
 
-        response_text = ""
-        try:
-            response_text = self._api_call_fn(text_chunk)
-            return self._parse_llm_json_output(response_text, text_chunk)
-
-        except Exception as e:
-            print(f"Error interno del pipeline API de {self.api_provider}: {e}")
-
-        return []
-
-    def _call_gemini_ner(self, text_chunk: str) -> str:
-        full_prompt = f"{self.base_prompt}\n\nTexto de entrada:\n{text_chunk}"
-        interaction = self.client.interactions.create(
-            model=self.api_model_name,
-            input=full_prompt
+        response_text = self.provider.complete(
+            system_prompt=self.base_prompt,
+            user_prompt=f"Texto de entrada:\n{text_chunk}",
         )
-        return interaction.output_text
-
-    def _call_openai_ner(self, text_chunk: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.api_model_name,
-            messages=[
-                {"role": "system", "content": self.base_prompt},
-                {"role": "user", "content": f"Texto de entrada:\n{text_chunk}"}
-            ]
-        )
-        return response.choices[0].message.content
-
-    def _call_anthropic_ner(self, text_chunk: str) -> str:
-        response = self.client.messages.create(
-            model=self.api_model_name,
-            max_tokens=4096,
-            system=[
-                {
-                    "type": "text",
-                    "text": self.base_prompt,
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ],
-            messages=[
-                {"role": "user", "content": f"Texto de entrada:\n{text_chunk}"}
-            ]
-        )
-        for block in response.content:
-            if block.type == "text":
-                return block.text
-        return ""
+        return self._parse_llm_json_output(response_text, text_chunk)
 
     def _parse_llm_json_output(self, response_text: str, fallback_context: str) -> list[tuple[str, str]]:
+        parsed_data = parse_json_object(response_text)
+        raw_items = parsed_data.get("fenotipos", [])
+
         extracted_list = []
-        try:
-            clean_text = response_text.replace("```json", "").replace("```", "").strip()
-            match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-            if match:
-                clean_text = match.group(0)
+        for item in raw_items:
+            if isinstance(item, dict):
+                feno = item.get("fenotipo", "").strip()
+                ctx = item.get("contexto", fallback_context).strip()
+                if feno:
+                    extracted_list.append((feno, ctx))
+            elif isinstance(item, str):
+                mention = item.strip()
+                if mention:
+                    extracted_list.append((mention, fallback_context))
 
-            parsed_data = json.loads(clean_text)
-            raw_items = parsed_data.get("fenotipos", [])
-
-            for item in raw_items:
-                if isinstance(item, dict):
-                    feno = item.get("fenotipo", "").strip()
-                    ctx = item.get("contexto", fallback_context).strip()
-                    if feno:
-                        extracted_list.append((feno, ctx))
-                elif isinstance(item, str):
-                    extracted_list.append((item.strip(), fallback_context))
-                    
-        except json.JSONDecodeError:
-            print(f"Fallo al parsear JSON. Salida cruda del modelo:\n{response_text}")
-
-        return list(set(extracted_list))
+        # Order has to survive across processes: it reaches the caller as the
+        # phenotype order, and a set() here made identical requests disagree.
+        return list(dict.fromkeys(extracted_list))
