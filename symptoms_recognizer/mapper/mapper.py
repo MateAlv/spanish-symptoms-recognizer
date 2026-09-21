@@ -28,6 +28,15 @@ DEFAULT_LOCAL_MODEL_PATH = os.path.join(CURRENT_DIR, LOCAL_MODEL_RELATIVE_PATH)
 MIN_DISTANCE_VECTORS = 0.5
 N_POOL_THREADS = 5
 
+# Mentions resolved per LLM call. 1 means one call each, which measured
+# fastest: N_POOL_THREADS short calls run concurrently, while one batched call
+# reasons over every mention in sequence. On TARS with claude-opus-5, 5
+# mentions took 8.7s per-mention against 30.9s batched, and 18 mentions 29.4s
+# against 37.1s. Batching would only pay off if per-call overhead dominated
+# token generation, which it does not here -- revisit for a provider where it
+# might, such as a hosted API with a slow cold start.
+MAP_BATCH_SIZE = 1
+
 class PhenotypeOntologyMapper:
     def __init__(self, model_path=None, tokenizer_path=None, ontology=None, ontology_file_path=None, 
                  api_provider=None, api_model_name=None, top_k=10, prompt=None):
@@ -105,39 +114,118 @@ class PhenotypeOntologyMapper:
 
         mapped_phenotypes = ["None"] * total_phenotypes
         mapping_logs = [None] * total_phenotypes
-        pending_calls = []
+        to_resolve = []
 
-        executor_ctx = ThreadPoolExecutor(max_workers=N_POOL_THREADS) if self.api_provider else nullcontext()
+        for i in range(total_phenotypes):
+            phenotype_name = phenotypes_with_context[i][0]
+            context_sentence = phenotypes_with_context[i][1]
+
+            if not heaps[i]:
+                mapping_logs[i] = {
+                    "phenotype": phenotype_name,
+                    "context": context_sentence,
+                    "candidates_text": "Ninguno (No superaron umbral de similitud vectorial)",
+                    "reasoning": "N/A",
+                    "final_code": "None"
+                }
+                continue
+
+            sorted_candidates = sorted(heaps[i], key=lambda x: x[0], reverse=True)
+
+            if not self.api_provider:
+                mapped_phenotypes[i] = sorted_candidates[0][1]
+                continue
+
+            candidates_text = ""
+            for rank, (sim, code, name) in enumerate(sorted_candidates):
+                candidates_text += f"{rank+1}. Código: {code} | Nombre: {name} | (Score vectorial: {sim:.2f})\n"
+
+            to_resolve.append((i, phenotype_name, context_sentence, candidates_text))
+
+        if to_resolve:
+            self._resolve_codes(to_resolve, mapped_phenotypes, mapping_logs)
+
+        self.last_mapping_logs = [log for log in mapping_logs if log is not None]
+
+        return mapped_phenotypes
+
+    def _resolve_codes(self, to_resolve, mapped_phenotypes, mapping_logs) -> None:
+        """Ask the model to pick a code for each mention, in as few calls as possible.
+
+        One call per mention is what the latency budget cannot afford: a
+        clinical history yields a dozen or more, and the process startup cost
+        of a CLI-backed provider is paid on every one. Mentions are sent in
+        groups instead, which the model answers in a single pass.
+
+        A custom prompt is per-mention by construction, so that path keeps the
+        original one-call-each behaviour rather than silently reinterpreting
+        someone's prompt as a batch instruction.
+        """
+        if self.prompt or MAP_BATCH_SIZE <= 1:
+            self._resolve_codes_individually(to_resolve, mapped_phenotypes, mapping_logs)
+            return
+
+        groups = [
+            to_resolve[start:start + MAP_BATCH_SIZE]
+            for start in range(0, len(to_resolve), MAP_BATCH_SIZE)
+        ]
+
+        executor_ctx = (
+            ThreadPoolExecutor(max_workers=min(N_POOL_THREADS, len(groups)))
+            if len(groups) > 1
+            else nullcontext()
+        )
 
         with executor_ctx as executor:
-            for i in range(total_phenotypes):
-                phenotype_name = phenotypes_with_context[i][0]
-                context_sentence = phenotypes_with_context[i][1]
+            if len(groups) > 1:
+                answers = list(executor.map(self._call_llm_rag_batch, groups))
+            else:
+                answers = [self._call_llm_rag_batch(groups[0])]
 
-                if not heaps[i]:
-                    mapping_logs[i] = {
-                        "phenotype": phenotype_name,
-                        "context": context_sentence,
-                        "candidates_text": "Ninguno (No superaron umbral de similitud vectorial)",
-                        "reasoning": "N/A",
-                        "final_code": "None"
-                    }
-                    continue
+        for group, (codes_by_index, reasoning) in zip(groups, answers):
+            for position, (i, phenotype_name, context_sentence, candidates_text) in enumerate(group):
+                # Keyed by position within the group, not by order of reply:
+                # a model that drops or reorders entries must not shift every
+                # later code onto the wrong mention.
+                hpo_code = codes_by_index.get(position, "None")
+                mapped_phenotypes[i] = hpo_code
+                mapping_logs[i] = {
+                    "phenotype": phenotype_name,
+                    "context": context_sentence,
+                    "candidates_text": candidates_text,
+                    "reasoning": reasoning,
+                    "final_code": hpo_code
+                }
 
-                sorted_candidates = sorted(heaps[i], key=lambda x: x[0], reverse=True)
+    def _resolve_codes_individually(self, to_resolve, mapped_phenotypes, mapping_logs) -> None:
+        """One call per mention, run concurrently across the thread pool."""
+        with ThreadPoolExecutor(max_workers=N_POOL_THREADS) as executor:
+            futures = [
+                (
+                    entry,
+                    executor.submit(
+                        self._call_llm_rag,
+                        self.prompt or self._build_single_prompt(entry),
+                    ),
+                )
+                for entry in to_resolve
+            ]
 
-                if not self.api_provider:
-                    mapped_phenotypes[i] = sorted_candidates[0][1]
-                    continue
+            for (i, phenotype_name, context_sentence, candidates_text), future in futures:
+                hpo_code, full_reasoning = future.result()
+                mapped_phenotypes[i] = hpo_code
+                mapping_logs[i] = {
+                    "phenotype": phenotype_name,
+                    "context": context_sentence,
+                    "candidates_text": candidates_text,
+                    "reasoning": full_reasoning,
+                    "final_code": hpo_code
+                }
 
-                candidates_text = ""
-                for rank, (sim, code, name) in enumerate(sorted_candidates):
-                    candidates_text += f"{rank+1}. Código: {code} | Nombre: {name} | (Score vectorial: {sim:.2f})\n"
+    def _build_single_prompt(self, entry) -> str:
+        _, phenotype_name, context_sentence, candidates_text = entry
 
-                if self.prompt:
-                    base_prompt = self.prompt
-                else:
-                    base_prompt = f"""Eres un experto en codificación clínica HPO.
+        return f"""Eres un experto en codificación clínica HPO.
 Contexto clínico original del paciente (oración específica):
 "{context_sentence}"
 
@@ -155,23 +243,80 @@ INSTRUCCIONES OBLIGATORIAS:
 {{"hpo_code": "código_elegido_o_None"}}
 ```"""
 
-                future = executor.submit(self._call_llm_rag, base_prompt)
-                pending_calls.append((i, future, phenotype_name, context_sentence, candidates_text))
+    def _build_batch_prompt(self, group) -> str:
+        blocks = []
+        for position, (_, phenotype_name, context_sentence, candidates_text) in enumerate(group):
+            blocks.append(
+                f"""### Fenotipo {position}
+Contexto clínico original del paciente (oración específica):
+"{context_sentence}"
 
-            for i, future, phenotype_name, context_sentence, candidates_text in pending_calls:
-                hpo_code, full_reasoning = future.result()
-                mapped_phenotypes[i] = hpo_code
-                mapping_logs[i] = {
-                    "phenotype": phenotype_name,
-                    "context": context_sentence,
-                    "candidates_text": candidates_text,
-                    "reasoning": full_reasoning,
-                    "final_code": hpo_code
-                }
+Fenotipo extraído a mapear: "{phenotype_name}"
 
-        self.last_mapping_logs = [log for log in mapping_logs if log is not None]
+Top {self.top_k} códigos candidatos pre-seleccionados de la ontología HPO:
+{candidates_text}"""
+            )
 
-        return mapped_phenotypes
+        joined = "\n\n".join(blocks)
+        indices = ", ".join(str(position) for position in range(len(group)))
+
+        return f"""Eres un experto en codificación clínica HPO.
+
+A continuación hay {len(group)} fenotipos extraídos de una historia clínica. Cada uno tiene su propio contexto y su propia lista de candidatos.
+
+{joined}
+
+INSTRUCCIONES OBLIGATORIAS:
+1. Para CADA fenotipo, evalúa internamente sus candidatos y selecciona el más adecuado según su contexto clínico.
+2. Elige ÚNICAMENTE entre los candidatos ofrecidos para ese fenotipo. No uses los candidatos de otro fenotipo.
+3. Si para un fenotipo ningún candidato tiene relación anatómica o semántica, su valor debe ser "None".
+4. Escribe una justificación breve (máximo 2 oraciones por fenotipo).
+5. Al final, DEBES incluir ÚNICAMENTE un bloque de código JSON con una entrada por fenotipo, usando su número como clave. Debe contener exactamente las claves {indices}:
+```json
+{{"codigos": {{"0": "HP:XXXXXXX_o_None", "1": "HP:XXXXXXX_o_None"}}}}
+```"""
+
+    def _call_llm_rag_batch(self, group) -> tuple[dict[int, str], str]:
+        """Resolve a group of mentions in one call.
+
+        Returns codes keyed by position within the group. A missing key means
+        the model did not answer for that mention, and the caller records
+        "None" rather than borrowing a neighbour's code.
+        """
+        response_text = self.provider.complete(
+            system_prompt="", user_prompt=self._build_batch_prompt(group)
+        )
+
+        try:
+            parsed = parse_json_object(response_text)
+        except LLMInvalidResponseError:
+            logger.warning(
+                "batched RAG reply was not usable JSON; recording no code for %d mentions",
+                len(group),
+            )
+            return {}, response_text
+
+        raw_codes = parsed.get("codigos", {})
+        if not isinstance(raw_codes, dict):
+            logger.warning("batched RAG reply had no 'codigos' object")
+            return {}, response_text
+
+        codes_by_index = {}
+        for key, value in raw_codes.items():
+            try:
+                position = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= position < len(group) and isinstance(value, str):
+                codes_by_index[position] = value.strip() or "None"
+
+        missing = len(group) - len(codes_by_index)
+        if missing:
+            logger.warning(
+                "batched RAG answered %d of %d mentions", len(codes_by_index), len(group)
+            )
+
+        return codes_by_index, response_text
 
     def _call_llm_rag(self, prompt: str) -> tuple[str, str]:
         """Ask the model to pick one HPO code out of the retrieved candidates.
