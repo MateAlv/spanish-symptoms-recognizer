@@ -10,7 +10,8 @@ name: Deploy to AWS
 # Off until the repository secret AWS_DEPLOY_ROLE_ARN exists, so merging this
 # file changes nothing by itself. No AWS key is stored here: GitHub signs in
 # with OIDC, as a role that only main of this repository can assume.
-# DEPLOY_READ_TOKEN reads diagnostic.ar-api, which is private.
+# DEPLOY_READ_TOKEN reads diagnostic.ar-api and the embeddings release of
+# diagnostic.ar-model, both private.
 
 on:
   push:
@@ -84,6 +85,13 @@ jobs:
       - uses: aws-actions/amazon-ecr-login@v2
 
       - uses: docker/setup-buildx-action@v3
+
+      # The extractor's HPO embeddings come ready made, from the
+      # diagnostic.ar-model release pinned in embeddings.lock.
+      - name: Fetch the pinned HPO embeddings
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_READ_TOKEN }}
+        run: api/services/api-gateway/fetch_embeddings.sh
 
       - name: Build the extractor
         uses: docker/build-push-action@v6
