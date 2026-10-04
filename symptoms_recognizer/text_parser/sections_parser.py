@@ -1,3 +1,4 @@
+from symptoms_recognizer.concurrency import map_in_order
 import spacy
 from medspacy.section_detection import SectionRule
 from symptoms_recognizer.ner_model.model import PhenotypesDetector
@@ -61,6 +62,7 @@ class SectionsSentencesParser(HistoryRecordParser):
         doc = self.text_nlp(text)
         
         raw_phenotypes = []
+        sentences = []
 
         for section in doc._.sections:
             if section.category in self.target_sections:
@@ -71,14 +73,13 @@ class SectionsSentencesParser(HistoryRecordParser):
                 
                 real_body_span = doc[start:end]
 
-                for sent in real_body_span.sents:
-                    sentence_text = sent.text.strip()
+                sentences.extend(
+                    sent.text.strip() for sent in real_body_span.sents if sent.text.strip()
+                )
 
-                    if not sentence_text:
-                        continue
-
-                    sentence_results = ner_model.detect_phenotypes(sentence_text)
-                    raw_phenotypes.extend(sentence_results)
+        # Each sentence is read on its own, so all of them at once, joined in order.
+        for sentence_results in map_in_order(ner_model.detect_phenotypes, sentences):
+            raw_phenotypes.extend(sentence_results)
 
         seen = set()
         unique_phenotypes = []

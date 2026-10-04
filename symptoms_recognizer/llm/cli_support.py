@@ -24,7 +24,11 @@ def require_binary(binary: str, hint: str) -> str:
 
 
 def run_cli(
-    command: list[str], timeout: int, label: str, expect_stdout: bool = True
+    command: list[str],
+    timeout: int,
+    label: str,
+    expect_stdout: bool = True,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Run a CLI command and return its stdout.
 
@@ -43,6 +47,7 @@ def run_cli(
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise LLMTimeoutError(f"{label} did not answer within {timeout}s") from exc

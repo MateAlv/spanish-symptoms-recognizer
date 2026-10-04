@@ -57,7 +57,13 @@ def build_provider(
     if rpm > 0:
         from symptoms_recognizer.llm.caching import RateLimitedProvider
 
-        base = RateLimitedProvider(base, requests_per_minute=rpm)
+        # The burst is how many calls may start at once. Its default (a sixth
+        # of a minute's budget) held back the mapper's fan-out once more
+        # mentions ran concurrently, so a deployment can raise it to match
+        # RECOGNIZER_LLM_THREADS; the per-minute budget is unchanged.
+        raw_burst = os.environ.get("LLM_REQUESTS_BURST")
+        burst = int(raw_burst) if raw_burst and raw_burst.strip() else None
+        base = RateLimitedProvider(base, requests_per_minute=rpm, burst=burst)
 
     if cache if cache is not None else _env_flag("LLM_CACHE_ENABLED", True):
         from symptoms_recognizer.llm.caching import CachingProvider

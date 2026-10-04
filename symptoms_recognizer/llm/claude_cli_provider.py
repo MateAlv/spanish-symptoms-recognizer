@@ -39,11 +39,19 @@ class ClaudeCLIProvider(LLMProvider):
         )
 
     def complete(self, system_prompt: str, user_prompt: str) -> str:
-        command = [self.binary, "-p", user_prompt, "--model", self.model]
+        # --no-session-persistence: each call is one-off, so writing its
+        # session to disk is wasted work.
+        command = [
+            self.binary, "-p", user_prompt, "--model", self.model, "--no-session-persistence",
+        ]
 
         # `claude -p` has no system-prompt slot of its own; appending keeps the
         # instructions ahead of the clinical text, as the API shape does.
         if system_prompt:
             command += ["--append-system-prompt", system_prompt]
 
-        return run_cli(command, timeout=self.timeout, label=f"claude({self.model})")
+        # Telemetry, error reporting and update checks add about a second to
+        # every start of the CLI and nothing to the reply; the prompt and the
+        # model are untouched.
+        env = {**os.environ, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+        return run_cli(command, timeout=self.timeout, label=f"claude({self.model})", env=env)
