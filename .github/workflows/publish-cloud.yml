@@ -1,0 +1,158 @@
+name: Publish to the cloud copy
+
+# A push to main rebuilds the symptom extractor of diagnostic.ar's
+# provider-neutral cloud copy: this recognizer inside the gateway of
+# MateAlv/diagnostic.ar-api (its latest main, whose
+# services/api-gateway/Dockerfile.recognizer builds the image). Both test
+# suites run inside the image, it is published to GHCR, and the `cloud`
+# channel moves to it. The machines follow that channel on their own: each
+# checks it every 5 minutes, deploys a new image, and goes back to the
+# previous one by itself if it fails its checks. Nothing here reaches into a
+# machine or holds a cloud credential. The whole picture is
+# infra/cloud/README.md in MateAlv/diagnostic.ar.
+#
+# DEPLOY_READ_TOKEN reads diagnostic.ar-api and the embeddings release of
+# diagnostic.ar-model, both private.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "examples/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# One publish at a time, and never cancelled halfway: the channel moves last.
+concurrency:
+  group: publish-cloud
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    outputs:
+      revision: ${{ steps.target.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: recognizer
+
+      - uses: actions/checkout@v4
+        with:
+          repository: MateAlv/diagnostic.ar-api
+          ref: main
+          token: ${{ secrets.DEPLOY_READ_TOKEN }}
+          path: api
+
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - id: target
+        run: |
+          set -euo pipefail
+          registry="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"   # GHCR names are lowercase
+          api=$(git -C api rev-parse --short=7 HEAD)
+          rec=${GITHUB_SHA::7}
+          echo "image=$registry/diagnosticar-cloud-hpo-recognizer:api-$api-rec-$rec" >> "$GITHUB_OUTPUT"
+          echo "tag=api-$api-rec-$rec" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The extractor's HPO embeddings come ready made, from the
+      # diagnostic.ar-model release pinned in embeddings.lock.
+      - name: Fetch the pinned HPO embeddings
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_READ_TOKEN }}
+        run: api/services/api-gateway/fetch_embeddings.sh
+
+      # The machine reads org.opencontainers.image.revision into its
+      # /deploy-status.json, which the last job compares against this tag.
+      - name: Build the extractor
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          file: ./api/services/api-gateway/Dockerfile.recognizer
+          build-contexts: recognizer=./recognizer
+          load: true
+          provenance: false
+          tags: ${{ steps.target.outputs.image }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.target.outputs.tag }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=cloud-recognizer
+          cache-to: type=gha,scope=cloud-recognizer,mode=max
+
+      - name: Test inside the image
+        run: |
+          docker run --rm -e PYTHONPATH=/app/services/api-gateway:/app:/opt/recognizer \
+            -w /app/services/api-gateway ${{ steps.target.outputs.image }} \
+            python -m pytest tests/ -q -p no:cacheprovider
+          docker run --rm -w /opt/recognizer ${{ steps.target.outputs.image }} \
+            python -m pytest symptoms_recognizer/tests/ -q -p no:cacheprovider
+
+      - name: Push
+        run: docker push --quiet ${{ steps.target.outputs.image }}
+
+      # Last, and only once it passed and exists.
+      - name: Move the channel
+        run: |
+          src=${{ steps.target.outputs.image }}
+          docker buildx imagetools create -t "${src%:*}:cloud" "$src"
+          echo "### Published \`${{ steps.target.outputs.tag }}\` to the \`cloud\` channel" >> "$GITHUB_STEP_SUMMARY"
+
+  # Optional: wait for each machine listed in the repository variable
+  # CLOUD_URLS (space-separated https://… URLs) to report this image running,
+  # so the outcome shows here. Without the variable it is skipped. A machine
+  # that rolled back fails this job; the machine itself is already back on
+  # the previous image.
+  report:
+    needs: publish
+    if: vars.CLOUD_URLS != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for the machines
+        env:
+          URLS: ${{ vars.CLOUD_URLS }}
+          EXPECT: '{"recognizer": "${{ needs.publish.outputs.revision }}"}'
+        run: |
+          set -euo pipefail
+          for url in $URLS; do
+            echo "::group::$url"
+            ok=""
+            for _ in $(seq 1 90); do
+              status=$(curl -sf --max-time 10 "$url/deploy-status.json" || true)
+              verdict=$(printf '%s' "$status" | python3 -c '
+          import json, os, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print("wait"); sys.exit()
+          imgs, expect = d.get("images", {}), json.loads(os.environ["EXPECT"])
+          ours = all(imgs.get(k, {}).get("revision") == v for k, v in expect.items())
+          if ours and d.get("result") == "ok":
+              print("ok")
+          elif d.get("result") in ("rolled_back", "failed") and not ours:
+              print("rolled_back:" + d.get("message", ""))
+          else:
+              print("wait")' )
+              case "$verdict" in
+                ok) echo "running"; ok=1; break ;;
+                rolled_back:*) echo "::error::$url rejected this image: ${verdict#rolled_back:}"; exit 1 ;;
+              esac
+              sleep 10
+            done
+            echo "::endgroup::"
+            [ -n "$ok" ] || { echo "::error::$url did not report this image within 15 minutes"; exit 1; }
+          done
