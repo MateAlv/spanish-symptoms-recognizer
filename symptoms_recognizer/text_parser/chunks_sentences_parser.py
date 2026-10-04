@@ -1,3 +1,4 @@
+from symptoms_recognizer.concurrency import map_in_order
 from symptoms_recognizer.ner_model.model import PhenotypesDetector
 from symptoms_recognizer.text_parser.text_parser_interface import HistoryRecordParser
 import spacy
@@ -59,9 +60,10 @@ class ChunkSentencesParser(HistoryRecordParser):
 
         chunks = self._build_chunks(sentences, ner_model.tokenizer)
 
+        # Each chunk is read on its own, so all of them at once, joined in order.
         raw_phenotypes = []
-        for chunk in chunks:
-            raw_phenotypes.extend(ner_model.detect_phenotypes(chunk))
+        for chunk_results in map_in_order(ner_model.detect_phenotypes, chunks):
+            raw_phenotypes.extend(chunk_results)
 
         seen = set()
         unique_phenotypes = []

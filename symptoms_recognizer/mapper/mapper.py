@@ -2,6 +2,7 @@ from pathlib import Path
 from scipy.spatial import distance
 from transformers import AutoTokenizer, AutoModel
 
+from symptoms_recognizer.concurrency import llm_threads
 from symptoms_recognizer.llm import build_provider
 from symptoms_recognizer.llm.base import LLMInvalidResponseError
 from symptoms_recognizer.llm.json_parsing import parse_json_object
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 import os
 import torch
 import heapq
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +28,10 @@ ACCEPTED_ONTOLOGIES_FILES = { HPO_ONTOLOGY_CODE : HPO_ABSOLUTE_INPUT_FILE_PATH }
 LOCAL_MODEL_RELATIVE_PATH = "semantic_model/clinlinker-kb-gp"
 DEFAULT_LOCAL_MODEL_PATH = os.path.join(CURRENT_DIR, LOCAL_MODEL_RELATIVE_PATH)
 MIN_DISTANCE_VECTORS = 0.5
-N_POOL_THREADS = 5
 
 # Mentions resolved per LLM call. 1 means one call each, which measured
-# fastest: N_POOL_THREADS short calls run concurrently, while one batched call
+# fastest: short calls run concurrently (up to RECOGNIZER_LLM_THREADS, see
+# symptoms_recognizer/concurrency.py), while one batched call
 # reasons over every mention in sequence. On TARS with claude-opus-5, 5
 # mentions took 8.7s per-mention against 30.9s batched, and 18 mentions 29.4s
 # against 37.1s. Batching would only pay off if per-call overhead dominated
@@ -66,6 +68,8 @@ class PhenotypeOntologyMapper:
         tok_p = tokenizer_path or DEFAULT_LOCAL_MODEL_PATH
         self.model = self._get_el_model(model_p).to(self.pytorch_device)
         self.tokenizer = self._get_el_tokenizer(tok_p)
+        self._hpo_batches = None
+        self._hpo_batches_lock = threading.Lock()
 
     def _get_el_model(self, path): return AutoModel.from_pretrained(path)
     def _get_el_tokenizer(self, path): return AutoTokenizer.from_pretrained(path)
@@ -83,15 +87,7 @@ class PhenotypeOntologyMapper:
 
         heaps = [[] for _ in range(total_phenotypes)]
 
-        for hpo_codes_batch in self._get_codes_batch():
-            codes_in_batch = list(hpo_codes_batch.keys())
-
-            vectors_in_batch = torch.stack([hpo_codes_batch[c]["vector"] for c in codes_in_batch]).to(self.pytorch_device)
-            names_in_batch = [hpo_codes_batch[c]["name"] for c in codes_in_batch]
-            
-            if vectors_in_batch.dim() == 3:
-                vectors_in_batch = vectors_in_batch.squeeze(1)
-
+        for codes_in_batch, names_in_batch, vectors_in_batch in self._hpo_vectors():
             similarities = torch.matmul(encoded_phenotypes_matrix, vectors_in_batch.T)
 
             k_batch = min(self.top_k, similarities.size(1))
@@ -171,7 +167,7 @@ class PhenotypeOntologyMapper:
         ]
 
         executor_ctx = (
-            ThreadPoolExecutor(max_workers=min(N_POOL_THREADS, len(groups)))
+            ThreadPoolExecutor(max_workers=min(llm_threads(), len(groups)))
             if len(groups) > 1
             else nullcontext()
         )
@@ -199,7 +195,7 @@ class PhenotypeOntologyMapper:
 
     def _resolve_codes_individually(self, to_resolve, mapped_phenotypes, mapping_logs) -> None:
         """One call per mention, run concurrently across the thread pool."""
-        with ThreadPoolExecutor(max_workers=N_POOL_THREADS) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, min(llm_threads(), len(to_resolve)))) as executor:
             futures = [
                 (
                     entry,
@@ -339,6 +335,26 @@ INSTRUCCIONES OBLIGATORIAS:
             return "None", response_text
 
         return parsed_data.get("hpo_code", "None"), response_text
+
+    def _hpo_vectors(self):
+        """The HPO embedding batches, stacked once and kept for every later request.
+
+        They never change while the process runs, and loading the 39 files
+        (62 MB) on every extraction was pure repeated work. Same batches, same
+        order as _get_codes_batch, so the candidates are the same.
+        """
+        if self._hpo_batches is None:
+            with self._hpo_batches_lock:
+                if self._hpo_batches is None:
+                    batches = []
+                    for hpo_codes_batch in self._get_codes_batch():
+                        codes = list(hpo_codes_batch.keys())
+                        vectors = torch.stack([hpo_codes_batch[c]["vector"] for c in codes]).to(self.pytorch_device)
+                        if vectors.dim() == 3:
+                            vectors = vectors.squeeze(1)
+                        batches.append((codes, [hpo_codes_batch[c]["name"] for c in codes], vectors))
+                    self._hpo_batches = batches
+        return self._hpo_batches
 
     def _get_codes_batch(self):
         batch_files = glob.glob(os.path.join(self.ontology_file_path, "*.pt"))
