@@ -13,6 +13,10 @@ name: Publish to the cloud copy
 #
 # DEPLOY_READ_TOKEN reads diagnostic.ar-api and the embeddings release of
 # diagnostic.ar-model, both private.
+#
+# The extractor is published from both repositories, so before moving its
+# channel this run checks it would not put older code back
+# (.github/scripts/cloud-channel-guard.py, the same in both).
 
 on:
   push:
@@ -25,6 +29,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: write   # to start a new run when each repository has a commit the other's image lacks
 
 # One publish at a time, and never cancelled halfway: the channel moves last.
 concurrency:
@@ -37,6 +42,7 @@ jobs:
     timeout-minutes: 75
     outputs:
       revision: ${{ steps.target.outputs.tag }}
+      moved: ${{ steps.guard.outputs.decision == 'move' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,8 +64,11 @@ jobs:
           registry="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"   # GHCR names are lowercase
           api=$(git -C api rev-parse --short=7 HEAD)
           rec=${GITHUB_SHA::7}
-          echo "image=$registry/diagnosticar-cloud-hpo-recognizer:api-$api-rec-$rec" >> "$GITHUB_OUTPUT"
-          echo "tag=api-$api-rec-$rec" >> "$GITHUB_OUTPUT"
+          {
+            echo "image=$registry/diagnosticar-cloud-hpo-recognizer:api-$api-rec-$rec"
+            echo "tag=api-$api-rec-$rec"
+            echo "api_commit=$(git -C api rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -87,9 +96,13 @@ jobs:
           load: true
           provenance: false
           tags: ${{ steps.target.outputs.image }}
+          # Both commits, full: cloud-channel-guard.py compares them with the
+          # channel's before moving it.
           labels: |
             org.opencontainers.image.revision=${{ steps.target.outputs.tag }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            ar.diagnostic.api.commit=${{ steps.target.outputs.api_commit }}
+            ar.diagnostic.recognizer.commit=${{ github.sha }}
           cache-from: type=gha,scope=cloud-recognizer
           cache-to: type=gha,scope=cloud-recognizer,mode=max
 
@@ -104,12 +117,46 @@ jobs:
       - name: Push
         run: docker push --quiet ${{ steps.target.outputs.image }}
 
+      # The extractor is published from diagnostic.ar-api too, and its run may
+      # have finished first with newer code.
+      - name: May this run move the channel?
+        id: guard
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DEPLOY_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          src=${{ steps.target.outputs.image }}
+          decision=$(python3 recognizer/.github/scripts/cloud-channel-guard.py "${src%:*}" \
+            "${{ steps.target.outputs.api_commit }}" "$GITHUB_SHA")
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "extractor: $decision"
+
       # Last, and only once it passed and exists.
       - name: Move the channel
+        if: steps.guard.outputs.decision == 'move'
         run: |
           src=${{ steps.target.outputs.image }}
           docker buildx imagetools create -t "${src%:*}:cloud" "$src"
           echo "### Published \`${{ steps.target.outputs.tag }}\` to the \`cloud\` channel" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Leave the channel as it is
+        if: steps.guard.outputs.decision == 'skip'
+        run: |
+          echo "::notice::The extractor's channel already has newer code; it stays."
+          echo "### Not published: the channel already has newer code" >> "$GITHUB_STEP_SUMMARY"
+
+      # Each side has a commit the other's image lacks: a new run takes the
+      # latest main of both, which has everything.
+      - name: Rebuild with both repositories' latest main
+        if: steps.guard.outputs.decision == 'rebuild'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run publish-cloud.yml -R "$GITHUB_REPOSITORY" --ref main
+          echo "::notice::The extractor's channel and this run each have a commit the other lacks; started a new run with both."
+          echo "### Not published: started a new run with both repositories' latest main" >> "$GITHUB_STEP_SUMMARY"
 
   # Optional: wait for each machine listed in the repository variable
   # CLOUD_URLS (space-separated https://… URLs) to report this image running,
@@ -118,7 +165,8 @@ jobs:
   # the previous image.
   report:
     needs: publish
-    if: vars.CLOUD_URLS != ''
+    # Only when this run moved the channel: otherwise there is nothing of its own to wait for.
+    if: vars.CLOUD_URLS != '' && needs.publish.outputs.moved == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
