@@ -1,6 +1,8 @@
 name: Publish to the cloud copy
 
-# A push to main rebuilds the symptom extractor of diagnostic.ar's
+# Run by hand (the Actions tab, or `gh workflow run publish-cloud.yml`), not on
+# every push: Actions minutes are a monthly quota shared by every repository of
+# the account. It rebuilds the symptom extractor of diagnostic.ar's
 # provider-neutral cloud copy: this recognizer inside the gateway of
 # MateAlv/diagnostic.ar-api (its latest main, whose
 # services/api-gateway/Dockerfile.recognizer builds the image). Both test
@@ -19,11 +21,6 @@ name: Publish to the cloud copy
 # (.github/scripts/cloud-channel-guard.py, the same in both).
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "examples/**"
   workflow_dispatch:
 
 permissions:
