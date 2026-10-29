@@ -1,3 +1,5 @@
+> **Esta es la copia que usa [diagnostic.ar](https://github.com/MateAlv/diagnosticar-plataforma).** El desarrollo original del reconocedor, con sus experimentos, está en [GMBUST-FIUBA/spanish-symptoms-recognizer](https://github.com/GMBUST-FIUBA/spanish-symptoms-recognizer). Acá se suman los cambios para integrarlo a la plataforma: elegir el proveedor de LLM, responder en el formato de `/extract-hpo` y publicar la imagen.
+
 # Sypmtoms recognizer in spanish
 
 ## Introduction
